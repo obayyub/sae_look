@@ -1,5 +1,5 @@
 import torch
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 from collections import defaultdict
 from torch import nn
 from src.models.sae_model import SAE
