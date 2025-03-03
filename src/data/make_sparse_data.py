@@ -17,9 +17,9 @@ def generate_hidden_data(dim=128, n_features=512,
     #generate sparsity weights
     for i in range(n_samples):
         active_feats = np.random.choice(n_features, size=sparsity, replace=False)
-        weights[i, active_feats] = np.random.randn(sparsity)
+        weights[i, active_feats] = np.ones(sparsity)
     #make hidden data via sum of sparse features
     hidden_data = weights @ features
 
     # Convert to tensor and move to device
-    return torch.tensor(hidden_data, dtype=torch.float32, device=DEVICE)
+    return torch.tensor(hidden_data, dtype=torch.float32, device=DEVICE), features

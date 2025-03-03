@@ -111,20 +111,16 @@ class BatchedSAE(nn.Module):
         
         # Shape: [n_models, input_dim, sae_hidden]
         self.W_in = nn.Parameter(
-            nn.init.kaiming_uniform_(
-                torch.empty(n_models, input_dim, self.sae_hidden, device=DEVICE),
-                nonlinearity="relu"
-            )
+            nn.init.xavier_normal_(
+                torch.empty(n_models, input_dim, self.sae_hidden, device=DEVICE))
         )
         # Shape: [n_models, sae_hidden]
         self.b_in = nn.Parameter(torch.zeros(n_models, self.sae_hidden, device=DEVICE))
         
         # Shape: [n_models, sae_hidden, input_dim]
         self.W_out = nn.Parameter(
-            nn.init.kaiming_uniform_(
-                torch.empty(n_models, self.sae_hidden, input_dim, device=DEVICE),
-                nonlinearity="relu"
-            )
+            nn.init.xavier_normal_(
+                torch.empty(n_models, self.sae_hidden, input_dim, device=DEVICE))
         )
         # Shape: [n_models, input_dim]
         self.b_out = nn.Parameter(torch.zeros(n_models, input_dim, device=DEVICE))
@@ -241,4 +237,149 @@ class BatchedSAE(nn.Module):
             'mse': total_mse_loss[m].item()/n_batches,
             'L0': total_l0[m].item()/n_batches,
             'L1 lambda': l1_lam,
+            'weights': self.W_out[m, :, :].detach().cpu().numpy(),
+            'biases': self.b_out[m, :].detach().cpu().numpy(),
+        } for m in range(self.n_models)]
+    
+
+class BatchedSAE_Updated(nn.Module):
+    '''
+    This is a modified version of BatchedSAE that uses a different initialization method. 
+    Link to the updates to SAE: https://transformer-circuits.pub/2024/april-update/index.html#training-saes
+    '''
+    def __init__(self, input_dim, n_models, width_ratio=4, activation=nn.ReLU()):
+        super().__init__()
+        self.n_models = n_models
+        self.sae_hidden = input_dim * width_ratio
+        
+        # Shape: [n_models, input_dim, sae_hidden]
+        self.W_in = nn.Parameter(
+            nn.init.xavier_normal_(
+                torch.empty(n_models, input_dim, self.sae_hidden, device=DEVICE))
+        )
+        # Shape: [n_models, sae_hidden]
+        self.b_in = nn.Parameter(torch.zeros(n_models, self.sae_hidden, device=DEVICE))
+        
+        # Shape: [n_models, sae_hidden, input_dim]
+        self.W_out = nn.Parameter(
+            nn.init.xavier_normal_(
+                torch.empty(n_models, self.sae_hidden, input_dim, device=DEVICE))
+        )
+        # Shape: [n_models, input_dim]
+        self.b_out = nn.Parameter(torch.zeros(n_models, input_dim, device=DEVICE))
+        self.nonlinearity = activation
+
+    def _normalize_weights(self):
+        with torch.no_grad():
+            # Normalize each model's weights separately
+            # Shape: [n_models, 1, input_dim]
+            norms = self.W_out.norm(p=2, dim=1, keepdim=True)
+            self.W_out.div_(norms)
+    
+    def forward(self, x):
+        # x shape is already: [n_models, batch_size, input_dim]
+        # Subtract bias for each model
+        x = x - self.b_out.unsqueeze(1)
+        
+        # Compute activations for each model
+        # bmm for batched matrix multiply
+        acts = self.nonlinearity(
+            torch.bmm(x, self.W_in) + self.b_in.unsqueeze(1)
+        )
+        
+        # Calculate regularization terms for each model
+        l1_regularization = acts.abs().sum(dim=[1, 2])  # [n_models]
+        l0 = (acts > 0).sum(dim=2).float().mean(dim=1)  # [n_models]
+        
+        self._normalize_weights()
+        
+        # Reconstruct input for each model
+        reconstruction = torch.bmm(acts, self.W_out) + self.b_out.unsqueeze(1)
+        
+        return l0, l1_regularization, reconstruction
+
+    def train(self, train_data, test_data, batch_size=128, n_epochs=10000, 
+              l1_lam=3e-5, weight_decay=1e-4, output_epoch=False,
+              patience=10, min_improvement=1e-4):
+        # Ensure train_data shape is [n_models, n_samples, input_dim]
+        assert train_data.dim() == 3 and train_data.size(0) == self.n_models, \
+            f"Expected train_data shape [n_models, n_samples, input_dim], got {train_data.shape}"
+        
+        n_samples = train_data.size(1)  # Use size(1) to get number of samples
+        batch_size = min(batch_size, n_samples)  # Ensure batch_size <= n_samples
+        n_batches = n_samples // batch_size
+        
+        # Initialize tracking variables
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3, weight_decay=weight_decay)
+        
+        # Initialize early stopping trackers for each model
+        best_losses = torch.full((self.n_models,), float('inf'), device=train_data.device)
+        patience_counters = torch.zeros(self.n_models, dtype=torch.int)
+        active_models = torch.ones(self.n_models, dtype=torch.bool, device=train_data.device)
+        
+        for epoch in range(n_epochs):
+            # Skip iteration if all models have converged
+            if not active_models.any():
+                break
+            
+            indices = torch.randperm(n_samples)
+            total_mse_loss = torch.zeros(self.n_models, device=train_data.device)
+            total_l1_loss = torch.zeros(self.n_models, device=train_data.device)
+            total_l0 = torch.zeros(self.n_models, device=train_data.device)
+            
+            # Process batches
+            for i in range(0, n_samples, batch_size):
+                batch_indices = indices[i:i+batch_size]
+                batch = train_data[:, batch_indices]  # Select samples for all models
+                
+                optimizer.zero_grad()
+                l0, l1, recon_hiddens = self(batch)
+                
+                # Calculate loss for each model separately - simplified
+                recon_loss = nn.MSELoss(reduction='none')(recon_hiddens, batch).mean(dim=[1, 2])  # [n_models]
+                
+                sparsity_loss = l1_lam * l1
+                loss = recon_loss + sparsity_loss
+                
+                # Sum losses across all models for backward
+                loss.sum().backward()
+                optimizer.step()
+                
+                total_mse_loss += recon_loss.detach()
+                total_l1_loss += sparsity_loss.detach()
+                total_l0 += l0.detach()
+
+            # Early stopping check for each model
+            avg_loss = total_mse_loss / n_batches
+            
+            for m in range(self.n_models):
+                if not active_models[m]:
+                    continue
+                
+                if avg_loss[m] < best_losses[m] - min_improvement:
+                    best_losses[m] = avg_loss[m]
+                    patience_counters[m] = 0
+                else:
+                    patience_counters[m] += 1
+                    if patience_counters[m] >= patience:
+                        active_models[m] = False
+                        if output_epoch:
+                            print(f'Model {m} converged at epoch {epoch} with loss {best_losses[m]:.4f}')
+
+            if (epoch % 10 == 0) and output_epoch:
+                avg_l1_loss = total_l1_loss / n_batches
+                avg_l0 = total_l0 / n_batches
+                
+                for m in range(self.n_models):
+                    if active_models[m]:
+                        print(f'Model {m}, Epoch {epoch}, Loss: {avg_loss[m]:.4f}, '
+                              f'L1: {avg_l1_loss[m]:.4f}, '
+                              f'L0: {avg_l0[m]:.4f}')
+
+        return [{
+            'mse': total_mse_loss[m].item()/n_batches,
+            'L0': total_l0[m].item()/n_batches,
+            'L1 lambda': l1_lam,
+            'weights': self.W_out[m, :, :].detach().cpu().numpy(),
+            'biases': self.b_out[m, :].detach().cpu().numpy(),
         } for m in range(self.n_models)]

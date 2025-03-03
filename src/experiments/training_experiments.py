@@ -64,11 +64,12 @@ def run_batched_DOE():
     train_datasets = []
     test_datasets = []
     
-    n_samples = 2**10  # 4096 samples
+    n_samples = 2**15  # 32768 samples
+    print(f"n_samples: {n_samples}")
     batch_size = 128   # Make sure batch_size < n_samples
     
     for sparsity in sparsities:
-        data = generate_hidden_data(dim=hidden_dim, n_samples=n_samples, sparsity=sparsity)
+        data, _ = generate_hidden_data(dim=hidden_dim, n_samples=n_samples, sparsity=sparsity)
         indices = torch.randperm(len(data))
         data = data[indices]
         train_size = int(0.8 * len(data))
@@ -99,4 +100,56 @@ def run_batched_DOE():
     
     return results
 
+def run_batched_DOE_with_features():
+    sparsities = [5, 10, 20, 30, 40, 50]
+    l1_lams = [2e-5, 3e-5, 4e-5, 5e-5, 6e-5]
+    hidden_dim = 128
+    results = defaultdict(list)
+    width_factor = 4
+    n_models = len(sparsities)
+    features_list = []
     
+    # Generate data for all sparsities at once
+    train_datasets = []
+    test_datasets = []
+    
+    n_samples = 2**10  # 32768 samples
+    batch_size = 128   # Make sure batch_size < n_samples
+    
+    for sparsity in sparsities:
+        data, features = generate_hidden_data(dim=hidden_dim, n_samples=n_samples, sparsity=sparsity)
+        indices = torch.randperm(len(data))
+        data = data[indices]
+        train_size = int(0.8 * len(data))
+        
+        if isinstance(data, torch.Tensor):
+            data = data.to(DEVICE)
+        
+        train_datasets.append(data[:train_size])
+        test_datasets.append(data[train_size:])
+        features_list.append(features)
+    
+    # Stack datasets and ensure they have the correct shape
+    train_data_stacked = torch.stack(train_datasets)  # [n_models, n_samples, hidden_dim]
+    test_data_stacked = torch.stack(test_datasets)    # [n_models, n_samples, hidden_dim]
+    
+    # Train models for all sparsities simultaneously
+    for l1_lam in tqdm(l1_lams, position=0, leave=False):
+        batched_model = BatchedSAE(hidden_dim, n_models=n_models, width_ratio=width_factor).to(DEVICE)
+        batch_results = batched_model.train(
+            train_data_stacked,
+            test_data_stacked,
+            batch_size=batch_size,
+            l1_lam=l1_lam
+        )
+        
+        # Store results for each sparsity
+        for i, sparsity in enumerate(sparsities):
+            # batch_results is a list of dictionaries, one per model
+            # Append both the model result and corresponding features
+            results[sparsity].append({
+                **batch_results[i],  # Unpack the model result dictionary
+                'features': features_list[i]  # Add the features
+            })
+    
+    return results
