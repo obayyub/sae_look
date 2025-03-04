@@ -2,7 +2,7 @@ import torch
 from tqdm import tqdm
 from collections import defaultdict
 from torch import nn
-from src.models.sae_model import SAE, BatchedSAE
+from src.models.sae_model import SAE, BatchedSAE, BatchedSAE_Updated
 from src.data.make_sparse_data import generate_hidden_data
 
 DEVICE = torch.device("cpu" if torch.backends.mps.is_available() else "cpu")
@@ -52,7 +52,7 @@ def run_DOE():
     
     return results
 
-def run_batched_DOE():
+def run_batched_DOE(model_type = BatchedSAE):
     sparsities = [5, 10, 20, 30, 40, 50]
     l1_lams = [2e-5, 3e-5, 4e-5, 5e-5, 6e-5]
     hidden_dim = 128
@@ -86,7 +86,7 @@ def run_batched_DOE():
     
     # Train models for all sparsities simultaneously
     for l1_lam in tqdm(l1_lams, position=0, leave=False):
-        batched_model = BatchedSAE(hidden_dim, n_models=n_models, width_ratio=width_factor).to(DEVICE)
+        batched_model = model_type(hidden_dim, n_models=n_models, width_ratio=width_factor).to(DEVICE)
         batch_results = batched_model.train(
             train_data_stacked,
             test_data_stacked,
@@ -100,9 +100,7 @@ def run_batched_DOE():
     
     return results
 
-def run_batched_DOE_with_features():
-    sparsities = [5, 10, 20, 30, 40, 50]
-    l1_lams = [2e-5, 3e-5, 4e-5, 5e-5, 6e-5]
+def run_batched_DOE_with_features(model_type = BatchedSAE_Updated, sparsities = [5, 10, 20, 30, 40, 50], l1_lams = [2e-5, 3e-5, 4e-5, 5e-5, 6e-5]):
     hidden_dim = 128
     results = defaultdict(list)
     width_factor = 4
@@ -113,8 +111,8 @@ def run_batched_DOE_with_features():
     train_datasets = []
     test_datasets = []
     
-    n_samples = 2**10  # 32768 samples
-    batch_size = 128   # Make sure batch_size < n_samples
+    n_samples = 2**12  # 32768 samples
+    batch_size = 256   # Make sure batch_size < n_samples
     
     for sparsity in sparsities:
         data, features = generate_hidden_data(dim=hidden_dim, n_samples=n_samples, sparsity=sparsity)
@@ -135,7 +133,7 @@ def run_batched_DOE_with_features():
     
     # Train models for all sparsities simultaneously
     for l1_lam in tqdm(l1_lams, position=0, leave=False):
-        batched_model = BatchedSAE(hidden_dim, n_models=n_models, width_ratio=width_factor).to(DEVICE)
+        batched_model = model_type(hidden_dim, n_models=n_models, width_ratio=width_factor).to(DEVICE)
         batch_results = batched_model.train(
             train_data_stacked,
             test_data_stacked,

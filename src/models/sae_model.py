@@ -246,55 +246,60 @@ class BatchedSAE_Updated(nn.Module):
     '''
     This is a modified version of BatchedSAE that uses a different initialization method. 
     Link to the updates to SAE: https://transformer-circuits.pub/2024/april-update/index.html#training-saes
+    
+    Key changes:
+    - Decoder weights (W_d) are no longer L2 normalized to unit norm
+    - L1 regularization is weighted by the L2 norm of decoder columns
+    - The decoder weights (W_d) are initialized with random directions and fixed L2 norm
+    - The encoder weights (W_e) are initialized as the transpose of W_d
+    - The decoder biases (b_d) are initialized to zero
+    - The encoder biases (b_e) are initialized to zero
     '''
     def __init__(self, input_dim, n_models, width_ratio=4, activation=nn.ReLU()):
         super().__init__()
         self.n_models = n_models
         self.sae_hidden = input_dim * width_ratio
         
+        # Initialize W_d with random directions and fixed L2 norm
+        W_d_init = torch.randn(n_models, self.sae_hidden, input_dim, device=DEVICE)
+        # Normalize columns to have L2 norm of 0.1
+        W_d_init = 0.1 * W_d_init / W_d_init.norm(p=2, dim=2, keepdim=True)
+        
+        # Initialize W_e as W_d transpose
+        W_e_init = W_d_init.transpose(1, 2)
+        
         # Shape: [n_models, input_dim, sae_hidden]
-        self.W_in = nn.Parameter(
-            nn.init.xavier_normal_(
-                torch.empty(n_models, input_dim, self.sae_hidden, device=DEVICE))
-        )
+        self.W_e = nn.Parameter(W_e_init)
+        
         # Shape: [n_models, sae_hidden]
-        self.b_in = nn.Parameter(torch.zeros(n_models, self.sae_hidden, device=DEVICE))
+        self.b_e = nn.Parameter(torch.zeros(n_models, self.sae_hidden, device=DEVICE))
         
         # Shape: [n_models, sae_hidden, input_dim]
-        self.W_out = nn.Parameter(
-            nn.init.xavier_normal_(
-                torch.empty(n_models, self.sae_hidden, input_dim, device=DEVICE))
-        )
+        self.W_d = nn.Parameter(W_d_init)
+        
         # Shape: [n_models, input_dim]
-        self.b_out = nn.Parameter(torch.zeros(n_models, input_dim, device=DEVICE))
+        self.b_d = nn.Parameter(torch.zeros(n_models, input_dim, device=DEVICE))
         self.nonlinearity = activation
-
-    def _normalize_weights(self):
-        with torch.no_grad():
-            # Normalize each model's weights separately
-            # Shape: [n_models, 1, input_dim]
-            norms = self.W_out.norm(p=2, dim=1, keepdim=True)
-            self.W_out.div_(norms)
     
     def forward(self, x):
         # x shape is already: [n_models, batch_size, input_dim]
-        # Subtract bias for each model
-        x = x - self.b_out.unsqueeze(1)
         
-        # Compute activations for each model
+        # Compute activations f(x) for each model
         # bmm for batched matrix multiply
         acts = self.nonlinearity(
-            torch.bmm(x, self.W_in) + self.b_in.unsqueeze(1)
+            torch.bmm(x, self.W_e) + self.b_e.unsqueeze(1)  # [n_models, batch_size, sae_hidden]
         )
         
-        # Calculate regularization terms for each model
-        l1_regularization = acts.abs().sum(dim=[1, 2])  # [n_models]
+        # Calculate L1 regularization weighted by decoder norm for each feature
+        # [n_models, batch_size, sae_hidden] * [n_models, sae_hidden, 1] -> [n_models]
+        decoder_norms = self.W_d.norm(p=2, dim=2)  # [n_models, sae_hidden]
+        l1_regularization = (acts.abs() * decoder_norms.unsqueeze(1)).sum(dim=[1, 2])  # [n_models]
+        
+        # Calculate L0 sparsity metric
         l0 = (acts > 0).sum(dim=2).float().mean(dim=1)  # [n_models]
         
-        self._normalize_weights()
-        
         # Reconstruct input for each model
-        reconstruction = torch.bmm(acts, self.W_out) + self.b_out.unsqueeze(1)
+        reconstruction = torch.bmm(acts, self.W_d) + self.b_d.unsqueeze(1)  # [n_models, batch_size, input_dim]
         
         return l0, l1_regularization, reconstruction
 
@@ -310,7 +315,7 @@ class BatchedSAE_Updated(nn.Module):
         n_batches = n_samples // batch_size
         
         # Initialize tracking variables
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3, weight_decay=weight_decay)
+        optimizer = torch.optim.Adam(self.parameters(), lr=5e-5)
         
         # Initialize early stopping trackers for each model
         best_losses = torch.full((self.n_models,), float('inf'), device=train_data.device)
@@ -380,6 +385,6 @@ class BatchedSAE_Updated(nn.Module):
             'mse': total_mse_loss[m].item()/n_batches,
             'L0': total_l0[m].item()/n_batches,
             'L1 lambda': l1_lam,
-            'weights': self.W_out[m, :, :].detach().cpu().numpy(),
-            'biases': self.b_out[m, :].detach().cpu().numpy(),
+            'weights': self.W_d[m, :, :].detach().cpu().numpy(),
+            'biases': self.b_d[m, :].detach().cpu().numpy(),
         } for m in range(self.n_models)]
