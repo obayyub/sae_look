@@ -4,31 +4,135 @@ from collections import defaultdict
 from torch import nn
 from src.models.sae_model import SAE, BatchedSAE, BatchedSAE_Updated
 from src.data.make_sparse_data import generate_hidden_data
+import os
+import sqlite3
+from datetime import datetime
+import pickle
+
+PROJECT_ROOT = os.environ.get("PROJECT_ROOT")
+DB_DIR = PROJECT_ROOT / "db"
+MODELS_DIR = PROJECT_ROOT / "models"
+MODELS_DIR.mkdir(exist_ok=True)
+DB_DIR.mkdir(exist_ok=True)
+DEFAULT_DB_PATH = DB_DIR / "experiments.db"
+
+def save_model(model, model_id):
+    model_path = MODELS_DIR / f"model_{model_id}.pt"
+    model_cpu = model.cpu()
+    torch.save(model_cpu.state_dict(), model_path)
+    return str(model_path.relative_to(PROJECT_ROOT))
+
+def load_model(model_path, model_class, input_dim, width_ratio):
+    full_path = PROJECT_ROOT / model_path
+    model = model_class(input_dim, width_ratio, nn.ReLU()).to(DEVICE)
+    model.load_state_dict(torch.load(full_path), map_location=DEVICE)
+    return model
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
 else:
     DEVICE = "cpu"
 
+def init_database(db_path=DEFAULT_DB_PATH):
+    '''Initialize the sqlite database'''
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
 
-def run_experiment():
-    sparsity = 50
-    hidden_dim = 512
-    width_factor = 4
+    c.execute('''CREATE TABLE IF NOT EXISTS experiments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        model_class TEXT,
+        model_path TEXT,
+        input_dim INTEGER,
+        width_ratio INTEGER,
+        batch_size INTEGER,
+        l1_lam REAL,
+        sparsity INTEGER,
+        n_basis_vectors INTEGER,
+        n_samples INTEGER,
+        mse REAL,
+        l0 REAL,
+        train_data BLOB
+    )''')
 
-    data = generate_hidden_data(dim=hidden_dim, sparsity=sparsity)
-    train_size = int(0.8 * len(data))
-    train_data, test_data = data[:train_size], data[train_size:]
+    conn.commit()
+    conn.close()
 
-    # Use global DEVICE
-    if isinstance(train_data, torch.Tensor):
-        train_data = train_data.to(DEVICE)
-        test_data = test_data.to(DEVICE)
+def save_experiment(results_dict, model, db_path=DEFAULT_DB_PATH):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
 
-    relu_model = SAE(hidden_dim, width_factor, nn.ReLU()).to(DEVICE)
-    print("Training ReLU model...")
-    result = relu_model.train(train_data, test_data, output_epoch=True)
+    if torch.is_tensor(results_dict['train_data']):
+        train_data = results_dict['train_data'].detach().cpu()
+    else:
+        train_data = results_dict['train_data']
 
+    c.execute('''INSERT INTO experiments (
+        timestamp,
+        model_class,
+        input_dim,
+        width_ratio,
+        batch_size,
+        l1_lam,
+        sparsity,
+        n_basis_vectors,
+        n_samples,
+        mse,
+        l0,
+        train_data
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        datetime.now().isoformat(),
+        model.__class__.__name__,
+        results_dict['input_dim'],
+        results_dict['width_ratio'],
+        results_dict['batch_size'],
+        results_dict['l1_lam'],
+        results_dict['sparsity'],
+        results_dict['n_basis_vectors'],
+        results_dict['n_samples'],
+        results_dict['mse'],
+        results_dict['l0'],
+        sqlite3.Binary(pickle.dumps(train_data))
+    ))
+
+    experiment_id = c.lastrowid
+
+    model_path = save_model(model, experiment_id)
+    c.execute('''UPDATE experiments SET model_path = ? WHERE id = ?''', 
+              (model_path, experiment_id))
+
+    conn.commit()
+    conn.close()
+
+def load_experiment(experiment_id, db_path=DEFAULT_DB_PATH, load_model=True):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+
+    c.execute('SELECT * FROM experiments WHERE id = ?', (experiment_id,))
+    row = c.fetchone()
+    if row is None:
+        return None
+    
+    columns = [desc[0] for desc in c.description]
+    result_dict = dict(zip(columns, row))
+
+    train_data_shape = (result_dict['n_basis_vectors'], result_dict['n_samples'])
+    result_dict['train_data'] = torch.from_numpy(
+        pickle.loads(result_dict['train_data'])
+    ).reshape(train_data_shape)
+    
+    if load_model:
+        model_class = globals()[result_dict['model_class']]
+        result_dict['model'] = load_model(
+            result_dict['model_path'], 
+            model_class, 
+            result_dict['input_dim'], 
+            result_dict['width_ratio']
+        )
+
+    conn.close()
+    return result_dict
 
 def run_DOE():
     sparsities = [5, 10, 20, 30, 40, 50]
