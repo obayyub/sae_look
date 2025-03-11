@@ -110,38 +110,38 @@ class BatchedSAE(nn.Module):
         self.sae_hidden = input_dim * width_ratio
         
         # Shape: [n_models, input_dim, sae_hidden]
-        self.W_in = nn.Parameter(
+        self.W_e = nn.Parameter(
             nn.init.xavier_normal_(
                 torch.empty(n_models, input_dim, self.sae_hidden, device=DEVICE))
         )
         # Shape: [n_models, sae_hidden]
-        self.b_in = nn.Parameter(torch.zeros(n_models, self.sae_hidden, device=DEVICE))
+        self.b_e = nn.Parameter(torch.zeros(n_models, self.sae_hidden, device=DEVICE))
         
         # Shape: [n_models, sae_hidden, input_dim]
-        self.W_out = nn.Parameter(
+        self.W_d = nn.Parameter(
             nn.init.xavier_normal_(
                 torch.empty(n_models, self.sae_hidden, input_dim, device=DEVICE))
         )
         # Shape: [n_models, input_dim]
-        self.b_out = nn.Parameter(torch.zeros(n_models, input_dim, device=DEVICE))
+        self.b_d = nn.Parameter(torch.zeros(n_models, input_dim, device=DEVICE))
         self.nonlinearity = activation
 
     def _normalize_weights(self):
         with torch.no_grad():
             # Normalize each model's weights separately
             # Shape: [n_models, 1, input_dim]
-            norms = self.W_out.norm(p=2, dim=1, keepdim=True)
-            self.W_out.div_(norms)
+            norms = self.W_d.norm(p=2, dim=1, keepdim=True)
+            self.W_d.div_(norms)
     
     def forward(self, x):
         # x shape is already: [n_models, batch_size, input_dim]
         # Subtract bias for each model
-        x = x - self.b_out.unsqueeze(1)
+        x = x - self.b_d.unsqueeze(1)
         
         # Compute activations for each model
         # bmm for batched matrix multiply
         acts = self.nonlinearity(
-            torch.bmm(x, self.W_in) + self.b_in.unsqueeze(1)
+            torch.bmm(x, self.W_e) + self.b_e.unsqueeze(1)
         )
         
         # Calculate regularization terms for each model
@@ -151,7 +151,7 @@ class BatchedSAE(nn.Module):
         self._normalize_weights()
         
         # Reconstruct input for each model
-        reconstruction = torch.bmm(acts, self.W_out) + self.b_out.unsqueeze(1)
+        reconstruction = torch.bmm(acts, self.W_d) + self.b_out.unsqueeze(1)
         
         return l0, l1_regularization, reconstruction
 
@@ -237,8 +237,8 @@ class BatchedSAE(nn.Module):
             'mse': total_mse_loss[m].item()/n_batches,
             'L0': total_l0[m].item()/n_batches,
             'L1 lambda': l1_lam,
-            'weights': self.W_out[m, :, :].detach().cpu().numpy(),
-            'biases': self.b_out[m, :].detach().cpu().numpy(),
+            'weights': self.W_d[m, :, :].detach().cpu().numpy(),
+            'biases': self.b_d[m, :].detach().cpu().numpy(),
         } for m in range(self.n_models)]
     
 
